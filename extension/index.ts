@@ -68,11 +68,14 @@ interface GoalExtensionState {
 }
 
 const GOAL_ENTRY_TYPE = "pi-goal.goal";
+const LEGACY_GOAL_ENTRY_TYPE = "pi-gui.goal";
 const GOAL_MESSAGE_TYPE = "pi-goal.goal.continuation";
+const LEGACY_GOAL_MESSAGE_TYPE = "pi-gui.goal.continuation";
 const GOAL_CONTINUATION_TRIGGER_CONTENT = "Goal continuation requested.";
 const GOAL_WIDGET_KEY = "pi-goal";
 const GOAL_STATUS_KEY = "goal";
 const GOAL_SIDECAR_SUFFIX = ".pi-goal.json";
+const LEGACY_GOAL_SIDECAR_SUFFIX = ".pi-gui-goal.json";
 const MAX_OBJECTIVE_LENGTH = 4000;
 
 export default function piGoalExtension(pi: ExtensionAPI) {
@@ -144,7 +147,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
     const activeGoal = activeContinuation ? currentGoal(ctx) : undefined;
     return {
       messages: event.messages.flatMap((message) => {
-        if (message.role !== "custom" || message.customType !== GOAL_MESSAGE_TYPE) {
+        if (message.role !== "custom" || !isGoalMessageType(message.customType)) {
           return [message];
         }
         const details = parseContinuationDetails(message.details);
@@ -599,7 +602,7 @@ function currentGoalState(ctx: ExtensionContext): CurrentGoalState {
       suppressedGoalId = undefined;
       continue;
     }
-    if (entry.type !== "custom" || entry.customType !== GOAL_ENTRY_TYPE) {
+    if (entry.type !== "custom" || !isGoalEntryType(entry.customType)) {
       continue;
     }
     const data = parseGoalEntryData(entry.data);
@@ -690,6 +693,14 @@ function updateGoalStatus(
 function appendGoalEntry(pi: ExtensionAPI, ctx: ExtensionContext, data: GoalEntryData): void {
   pi.appendEntry(GOAL_ENTRY_TYPE, data);
   forcePersistSession(ctx.sessionManager);
+}
+
+function isGoalEntryType(customType: string): boolean {
+  return customType === GOAL_ENTRY_TYPE || customType === LEGACY_GOAL_ENTRY_TYPE;
+}
+
+function isGoalMessageType(customType: string): boolean {
+  return customType === GOAL_MESSAGE_TYPE || customType === LEGACY_GOAL_MESSAGE_TYPE;
 }
 
 interface ForcePersistableSessionManager {
@@ -846,17 +857,17 @@ function readGoalSidecarBaseLeafId(ctx: ExtensionContext, goalId: string): strin
 }
 
 function readGoalSidecarData(ctx: ExtensionContext): Partial<GoalSidecarData> | undefined {
-  const sidecarPath = goalSidecarPath(ctx);
-  if (!sidecarPath) {
-    return undefined;
+  for (const sidecarPath of goalSidecarReadPaths(ctx)) {
+    try {
+      const parsed = JSON.parse(readFileSync(sidecarPath, "utf8")) as Partial<GoalSidecarData>;
+      if (parsed.version === 1) {
+        return parsed;
+      }
+    } catch {
+      continue;
+    }
   }
-
-  try {
-    const parsed = JSON.parse(readFileSync(sidecarPath, "utf8")) as Partial<GoalSidecarData>;
-    return parsed.version === 1 ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
+  return undefined;
 }
 
 function writeGoalSidecar(ctx: ExtensionContext, goal: ThreadGoal | null, baseLeafId: string | null): void {
@@ -885,6 +896,16 @@ function writeGoalSidecar(ctx: ExtensionContext, goal: ThreadGoal | null, baseLe
 function goalSidecarPath(ctx: ExtensionContext): string | undefined {
   const sessionFile = ctx.sessionManager.getSessionFile();
   return sessionFile ? `${sessionFile}${GOAL_SIDECAR_SUFFIX}` : undefined;
+}
+
+function goalSidecarReadPaths(ctx: ExtensionContext): string[] {
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  return sessionFile
+    ? [
+        `${sessionFile}${GOAL_SIDECAR_SUFFIX}`,
+        `${sessionFile}${LEGACY_GOAL_SIDECAR_SUFFIX}`,
+      ]
+    : [];
 }
 
 function validateObjective(value: string): string {
