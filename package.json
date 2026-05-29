@@ -1,5 +1,5 @@
 {
-  "name": "pi-goal",
+  "name": "@minghinmatthewlam/pi-goal",
   "version": "0.1.0",
   "description": "Persistent goal mode for pi with automatic idle continuation",
   "type": "module",
@@ -22,10 +22,13 @@
     "typescript": "^5.9.3"
   },
   "files": ["extension", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "MIT",
   "author": "minghinmatthewlam",
   "repository": {
     "type": "git",
-    "url": "https://github.com/minghinmatthewlam/pi-goal"
+    "url": "git+https://github.com/minghinmatthewlam/pi-goal.git"
   }
 }
