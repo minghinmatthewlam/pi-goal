@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 type GoalStatus = "active" | "paused" | "blocked" | "complete";
+type GoalStatusInput = GoalStatus | "achieved" | "completed" | "done";
 
 interface ThreadGoal {
   readonly goalId: string;
@@ -65,6 +66,7 @@ interface GoalExtensionState {
   continuationScheduled: boolean;
   pendingTreeEditorGoalId: string | undefined;
   treeEditorGoalId: string | undefined;
+  uiRefreshTimer: ReturnType<typeof setInterval> | undefined;
 }
 
 const GOAL_ENTRY_TYPE = "pi-goal.goal";
@@ -77,6 +79,7 @@ const GOAL_STATUS_KEY = "goal";
 const GOAL_SIDECAR_SUFFIX = ".pi-goal.json";
 const LEGACY_GOAL_SIDECAR_SUFFIX = ".pi-gui-goal.json";
 const MAX_OBJECTIVE_LENGTH = 4000;
+const NUMBER_FORMAT = new Intl.NumberFormat("en-US");
 
 export default function piGoalExtension(pi: ExtensionAPI) {
   const state: GoalExtensionState = {
@@ -92,6 +95,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
     continuationScheduled: false,
     pendingTreeEditorGoalId: undefined,
     treeEditorGoalId: undefined,
+    uiRefreshTimer: undefined,
   };
 
   pi.registerCommand("goal", {
@@ -261,7 +265,9 @@ function restoreGoalSession(
   const goal = goalState.goal;
   discardContinuationsForInactiveGoal(state, ctx, goal?.status === "active" ? goal.goalId : undefined);
   state.suppressedGoalId = goalState.suppressedGoalId;
+  stopGoalUiRefresh(state);
   renderGoalUi(ctx, goal);
+  syncGoalUiRefresh(state, ctx, goal);
   if ((options.scheduleContinuation ?? true) && goal?.status === "active") {
     scheduleGoalContinuation(pi, state, ctx);
   }
@@ -373,7 +379,7 @@ async function handleGoalCommand(
     updateGoalStatus(pi, state, ctx, goalState, "active");
     return;
   }
-  if (command === "complete") {
+  if (command === "complete" || command === "completed" || command === "achieved" || command === "done") {
     cancelGoalContinuation(state, ctx, goal?.goalId);
     updateGoalStatus(pi, state, ctx, goalState, "complete");
     return;
@@ -441,10 +447,14 @@ function createCreateGoalTool(pi: ExtensionAPI, state: GoalExtensionState) {
     name: "create_goal",
     label: "Create Goal",
     description:
-      "Create a goal only when explicitly requested by the user or system/developer instructions. Fails if a goal already exists.",
+      "Create a goal only when explicitly requested by the user or system/developer instructions. Fails if a goal already exists. Do not set a token budget unless the user explicitly requested one.",
     parameters: Type.Object({
       objective: Type.String({ description: "The concrete objective to start pursuing." }),
-      token_budget: Type.Optional(Type.Integer({ description: "Optional positive token budget." })),
+      token_budget: Type.Optional(
+        Type.Integer({
+          description: "Optional positive token budget. Omit unless the user explicitly supplied a budget.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const goalState = currentGoalState(ctx);
@@ -473,9 +483,15 @@ function createUpdateGoalTool(pi: ExtensionAPI, state: GoalExtensionState) {
     name: "update_goal",
     label: "Update Goal",
     description:
-      "Update the existing goal. Use this tool only to mark the goal achieved or blocked; pause, resume, and clear are user-controlled.",
+      "Update the existing goal. Use this tool only to mark the goal complete, achieved, or blocked; pause, resume, and clear are user-controlled.",
     parameters: Type.Object({
-      status: Type.Union([Type.Literal("complete"), Type.Literal("blocked")]),
+      status: Type.Union([
+        Type.Literal("complete"),
+        Type.Literal("completed"),
+        Type.Literal("achieved"),
+        Type.Literal("done"),
+        Type.Literal("blocked"),
+      ]),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const goalState = currentGoalState(ctx);
@@ -497,7 +513,7 @@ function createUpdateGoalTool(pi: ExtensionAPI, state: GoalExtensionState) {
       if (runningContinuation && runningContinuation.goalId !== goal.goalId) {
         return errorToolResult("cannot update goal because the active goal changed");
       }
-      const nextGoal = updateGoal(goal, params.status);
+      const nextGoal = updateGoal(goal, normalizeGoalStatus(params.status));
       saveGoal(pi, state, ctx, nextGoal, goalState.sidecarBaseLeafId);
       return goalToolResult(nextGoal);
     },
@@ -649,6 +665,7 @@ function saveGoal(
   const baseLeafId = sidecarBaseLeafId ?? ctx.sessionManager.getLeafId();
   writeGoalSidecar(ctx, goal, baseLeafId);
   renderGoalUi(ctx, goal);
+  syncGoalUiRefresh(state, ctx, goal);
 }
 
 function clearGoal(
@@ -667,6 +684,7 @@ function clearGoal(
   } satisfies GoalEntryData);
   writeGoalSidecar(ctx, null, baseLeafId);
   renderGoalUi(ctx, undefined);
+  stopGoalUiRefresh(state);
   ctx.ui.notify(goal ? "Goal cleared" : "No goal is currently set", "info");
 }
 
@@ -744,24 +762,50 @@ function markSessionFlushed(manager: ForcePersistableSessionManager): void {
 }
 
 function renderGoalUi(ctx: ExtensionContext, goal: ThreadGoal | undefined): void {
-  if (!goal || goal.status === "complete") {
+  const normalized = goal ? normalizeGoal(goal) : undefined;
+  if (!normalized || normalized.status === "complete") {
     ctx.ui.setStatus(GOAL_STATUS_KEY, undefined);
     ctx.ui.setWidget(GOAL_WIDGET_KEY, undefined, { placement: "aboveEditor" });
     return;
   }
 
-  ctx.ui.setStatus(GOAL_STATUS_KEY, `${goal.status}: ${truncate(goal.objective, 80)}`);
+  ctx.ui.setStatus(GOAL_STATUS_KEY, `${normalized.status}: ${truncate(normalized.objective, 80)}`);
   ctx.ui.setWidget(
     GOAL_WIDGET_KEY,
     [
-      `Goal: ${truncate(goal.objective, 160)}`,
-      `Status: ${goal.status}`,
-      goal.tokenBudget === null
-        ? `Usage: ${goal.tokensUsed} tokens, ${goal.timeUsedSeconds} seconds`
-        : `Usage: ${goal.tokensUsed}/${goal.tokenBudget} tokens, ${goal.timeUsedSeconds} seconds`,
+      `Goal: ${truncate(normalized.objective, 160)}`,
+      `Status: ${normalized.status}`,
+      formatTokenUsageLine(normalized),
+      `Elapsed: ${formatElapsedTime(normalized.timeUsedSeconds)}`,
     ],
     { placement: "aboveEditor" },
   );
+}
+
+function syncGoalUiRefresh(state: GoalExtensionState, ctx: ExtensionContext, goal: ThreadGoal | undefined): void {
+  if (goal?.status !== "active") {
+    stopGoalUiRefresh(state);
+    return;
+  }
+  if (state.uiRefreshTimer) {
+    return;
+  }
+  state.uiRefreshTimer = setInterval(() => {
+    const current = currentGoal(ctx);
+    renderGoalUi(ctx, current);
+    if (current?.status !== "active") {
+      stopGoalUiRefresh(state);
+    }
+  }, 1000);
+  state.uiRefreshTimer.unref?.();
+}
+
+function stopGoalUiRefresh(state: GoalExtensionState): void {
+  if (!state.uiRefreshTimer) {
+    return;
+  }
+  clearInterval(state.uiRefreshTimer);
+  state.uiRefreshTimer = undefined;
 }
 
 function createGoalSnapshot(objective: string, tokenBudget: number | null): ThreadGoal {
@@ -778,11 +822,11 @@ function createGoalSnapshot(objective: string, tokenBudget: number | null): Thre
   };
 }
 
-function updateGoal(goal: ThreadGoal, status: GoalStatus): ThreadGoal {
+function updateGoal(goal: ThreadGoal, status: GoalStatusInput): ThreadGoal {
   const now = Date.now();
   return normalizeGoal({
     ...goal,
-    status,
+    status: normalizeGoalStatus(status),
     updatedAt: now,
     timeUsedSeconds: Math.max(goal.timeUsedSeconds, Math.floor((now - goal.createdAt) / 1000)),
   });
@@ -792,10 +836,21 @@ function normalizeGoal(goal: ThreadGoal): ThreadGoal {
   const now = Date.now();
   return {
     ...goal,
+    status: normalizeGoalStatus(goal.status),
     tokenBudget: goal.tokenBudget ?? null,
     tokensUsed: Math.max(0, Math.floor(goal.tokensUsed)),
     timeUsedSeconds: Math.max(goal.timeUsedSeconds, Math.floor((now - goal.createdAt) / 1000)),
   };
+}
+
+function normalizeGoalStatus(status: unknown): GoalStatus {
+  if (status === "achieved" || status === "completed" || status === "done") {
+    return "complete";
+  }
+  if (status === "active" || status === "paused" || status === "blocked" || status === "complete") {
+    return status;
+  }
+  return "active";
 }
 
 function parseGoalEntryData(data: unknown): GoalEntryData | undefined {
@@ -984,11 +1039,46 @@ function errorToolResult(message: string) {
 
 function goalSummary(goal: ThreadGoal): string {
   const normalized = normalizeGoal(goal);
-  const usage =
-    normalized.tokenBudget === null
-      ? `${normalized.tokensUsed} tokens`
-      : `${normalized.tokensUsed}/${normalized.tokenBudget} tokens`;
-  return `Goal ${normalized.status}: ${truncate(normalized.objective, 180)} (${usage}, ${normalized.timeUsedSeconds} seconds)`;
+  return `Goal ${normalized.status}: ${truncate(normalized.objective, 180)} (${formatTokenUsageInline(
+    normalized,
+  )}, ${formatElapsedTime(normalized.timeUsedSeconds)})`;
+}
+
+function formatTokenUsageLine(goal: ThreadGoal): string {
+  return `Tokens: ${formatTokenUsageInline(goal)}`;
+}
+
+function formatTokenUsageInline(goal: ThreadGoal): string {
+  const used = `${formatCount(goal.tokensUsed)} used`;
+  if (goal.tokenBudget === null) {
+    return used;
+  }
+
+  const budget = formatCount(goal.tokenBudget);
+  const remaining = goal.tokenBudget - goal.tokensUsed;
+  if (remaining >= 0) {
+    return `${used} (${formatCount(remaining)} remaining of ${budget} budget)`;
+  }
+  return `${used} (${budget} budget exceeded by ${formatCount(Math.abs(remaining))})`;
+}
+
+function formatElapsedTime(seconds: number): string {
+  const normalized = Math.max(0, Math.floor(seconds));
+  if (normalized < 60) {
+    return `${normalized}s`;
+  }
+  const minutes = Math.floor(normalized / 60);
+  const remainingSeconds = normalized % 60;
+  if (minutes < 60) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `${hours}h ${remainingMinutes}m ${remainingSeconds}s`;
+}
+
+function formatCount(value: number): string {
+  return NUMBER_FORMAT.format(Math.max(0, Math.floor(value)));
 }
 
 function truncate(value: string, maxLength: number): string {

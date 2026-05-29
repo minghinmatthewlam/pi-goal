@@ -20,6 +20,7 @@ pi install git:github.com/minghinmatthewlam/pi-goal
 /goal ship the auth refactor and verify it in the running app
 /goal pause
 /goal resume
+/goal complete
 /goal clear
 ```
 
@@ -29,7 +30,7 @@ The extension also exposes model-callable tools:
 |------|-------------|
 | `get_goal` | Inspect the current goal and usage. |
 | `create_goal` | Create a new active goal when the user explicitly asks. |
-| `update_goal` | Mark the active goal complete or blocked. |
+| `update_goal` | Mark the active goal complete/achieved or blocked. |
 
 ## How It Works
 

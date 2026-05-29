@@ -1,6 +1,6 @@
 {
   "name": "@matthewlam/pi-goal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Persistent goal mode for pi with automatic idle continuation",
   "type": "module",
   "keywords": ["pi-package", "pi", "goal", "agent-continuation", "automation"],
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run typecheck"
+    "test": "npm run typecheck && node test/goal-extension-smoke.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -19,6 +19,7 @@
     "@earendil-works/pi-ai": "^0.74.0",
     "@earendil-works/pi-coding-agent": "^0.74.0",
     "@types/node": "^24.0.0",
+    "jiti": "^2.7.0",
     "typescript": "^5.9.3"
   },
   "files": ["extension", "README.md", "LICENSE"],
