@@ -517,7 +517,11 @@ function createUpdateGoalTool(pi: ExtensionAPI, state: GoalExtensionState) {
       if (runningContinuation && runningContinuation.goalId !== goal.goalId) {
         return errorToolResult("cannot update goal because the active goal changed");
       }
-      const nextGoal = updateGoal(goal, normalizeGoalStatus(params.status));
+      const status = normalizeGoalStatus(params.status);
+      if (!status) {
+        return errorToolResult("cannot update goal because the requested status is invalid");
+      }
+      const nextGoal = updateGoal(goal, status);
       saveGoal(pi, state, ctx, nextGoal, goalState.sidecarBaseLeafId);
       return goalToolResult(nextGoal);
     },
@@ -827,10 +831,14 @@ function createGoalSnapshot(objective: string, tokenBudget: number | null): Thre
 }
 
 function updateGoal(goal: ThreadGoal, status: GoalStatusInput): ThreadGoal {
+  const normalizedStatus = normalizeGoalStatus(status);
+  if (!normalizedStatus) {
+    throw new Error("Invalid goal status");
+  }
   const now = Date.now();
   return normalizeGoal({
     ...goal,
-    status: normalizeGoalStatus(status),
+    status: normalizedStatus,
     updatedAt: now,
     timeUsedSeconds: Math.max(goal.timeUsedSeconds, Math.floor((now - goal.createdAt) / 1000)),
   });
@@ -840,21 +848,21 @@ function normalizeGoal(goal: ThreadGoal): ThreadGoal {
   const now = Date.now();
   return {
     ...goal,
-    status: normalizeGoalStatus(goal.status),
+    status: normalizeGoalStatus(goal.status) ?? "paused",
     tokenBudget: goal.tokenBudget ?? null,
     tokensUsed: Math.max(0, Math.floor(goal.tokensUsed)),
     timeUsedSeconds: Math.max(goal.timeUsedSeconds, Math.floor((now - goal.createdAt) / 1000)),
   };
 }
 
-function normalizeGoalStatus(status: unknown): GoalStatus {
+function normalizeGoalStatus(status: unknown): GoalStatus | undefined {
   if (status === "achieved" || status === "completed" || status === "done") {
     return "complete";
   }
   if (status === "active" || status === "paused" || status === "blocked" || status === "complete") {
     return status;
   }
-  return "active";
+  return undefined;
 }
 
 function parseGoalEntryData(data: unknown): GoalEntryData | undefined {

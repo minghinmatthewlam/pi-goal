@@ -165,6 +165,44 @@ async function runUpdateGoal(harness, status) {
 {
   const harness = createExtensionHarness();
   try {
+    const now = Date.now();
+    harness.entries.push({
+      id: "corrupt-goal",
+      type: "custom",
+      customType: "pi-goal.goal",
+      data: {
+        version: 1,
+        event: "set",
+        goalId: "corrupt-goal",
+        goal: {
+          goalId: "corrupt-goal",
+          objective: "do not auto-continue corrupt state",
+          status: "migrating",
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 5,
+          createdAt: now - 5_000,
+          updatedAt: now - 5_000,
+        },
+      },
+    });
+
+    await harness.runEvent("session_start");
+
+    assert(harness.widgetLines().includes("Status: paused"));
+    assert(harness.widgetLines().includes("Elapsed: 5s"));
+
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    assert(harness.widgetLines().includes("Elapsed: 5s"));
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = createExtensionHarness();
+  try {
     await runGoalCommand(harness, "watch elapsed time");
     assert(harness.widgetLines().includes("Elapsed: 0s"));
 
