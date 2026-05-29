@@ -5,7 +5,7 @@ Persistent goal mode for [pi](https://github.com/badlogic/pi-mono). Set a long-r
 ## Install
 
 ```bash
-pi install npm:@minghinmatthewlam/pi-goal
+pi install npm:@matthewlam/pi-goal
 ```
 
 Or from git:
