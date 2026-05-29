@@ -113,6 +113,10 @@ export default function piGoalExtension(pi: ExtensionAPI) {
     restoreGoalSession(pi, state, ctx);
   });
 
+  pi.on("session_shutdown", async () => {
+    stopGoalUiRefresh(state);
+  });
+
   pi.on("model_select", async (_event, ctx) => {
     restoreGoalSession(pi, state, ctx);
   });

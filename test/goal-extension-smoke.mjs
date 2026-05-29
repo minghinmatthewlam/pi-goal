@@ -9,6 +9,7 @@ const { default: piGoalExtension } = await jiti.import("../extension/index.ts");
 
 function createExtensionHarness() {
   const commands = new Map();
+  const handlers = new Map();
   const tools = new Map();
   const entries = [];
   const tempDir = mkdtempSync(join(tmpdir(), "pi-goal-smoke-"));
@@ -63,7 +64,11 @@ function createExtensionHarness() {
     registerTool(tool) {
       tools.set(tool.name, tool);
     },
-    on() {},
+    on(name, handler) {
+      const existing = handlers.get(name) ?? [];
+      existing.push(handler);
+      handlers.set(name, existing);
+    },
     appendEntry(customType, data) {
       entries.push({
         id: `entry-${++entryCounter}`,
@@ -85,6 +90,11 @@ function createExtensionHarness() {
     entries,
     tools,
     cleanup: () => rmSync(tempDir, { force: true, recursive: true }),
+    runEvent: async (name, event = {}) => {
+      for (const handler of handlers.get(name) ?? []) {
+        await handler(event, ctx);
+      }
+    },
     widgetLines: () => ui.widgets.get("pi-goal") ?? [],
   };
 }
@@ -162,6 +172,21 @@ async function runUpdateGoal(harness, status) {
 
     assert(harness.widgetLines().some((line) => /^Elapsed: [12]s$/.test(line)));
     await runGoalCommand(harness, "clear");
+  } finally {
+    harness.cleanup();
+  }
+}
+
+{
+  const harness = createExtensionHarness();
+  try {
+    await runGoalCommand(harness, "stop refreshing after shutdown");
+    assert(harness.widgetLines().includes("Elapsed: 0s"));
+
+    await harness.runEvent("session_shutdown");
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    assert(harness.widgetLines().includes("Elapsed: 0s"));
   } finally {
     harness.cleanup();
   }
