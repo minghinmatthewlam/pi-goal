@@ -205,7 +205,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
       clearActiveTurn(state);
       return;
     }
-    if (runningContinuation && event.toolResults.length > 0) {
+    if (runningContinuation && (event.toolResults.length > 0 || messageHasGoalUpdateAttempt(event.message))) {
       runningContinuation.hadToolProgress = true;
     }
     const expectedGoalId = runningContinuation?.goalId ?? state.activeTurnGoalId ?? state.activeAgentGoalId;
@@ -565,7 +565,6 @@ async function maybeContinueGoal(pi: ExtensionAPI, state: GoalExtensionState, ct
     state.suppressedGoalId === goal.goalId ||
     goalState.suppressedGoalId === goal.goalId ||
     state.treeEditorGoalId === goal.goalId ||
-    isTokenBudgetExhausted(goal) ||
     !model ||
     !ctx.modelRegistry.hasConfiguredAuth(model) ||
     !ctx.isIdle() ||
@@ -621,9 +620,22 @@ function currentGoalState(ctx: ExtensionContext): CurrentGoalState {
   let suppressedGoalId: string | undefined;
   let goalEntryId: string | undefined;
   let sawGoalStateEntry = false;
+  let activeContinuationId: string | undefined;
+  let activeContinuationGoalId: string | undefined;
+  let activeContinuationHadGoalUpdateAttempt = false;
+  const resetTrackedContinuation = () => {
+    activeContinuationId = undefined;
+    activeContinuationGoalId = undefined;
+    activeContinuationHadGoalUpdateAttempt = false;
+  };
   for (const entry of ctx.sessionManager.getBranch()) {
-    if (entry.type === "message" && entry.message.role === "user") {
-      suppressedGoalId = undefined;
+    if (entry.type === "message") {
+      if (entry.message.role === "user") {
+        suppressedGoalId = undefined;
+        resetTrackedContinuation();
+      } else if (messageHasGoalUpdateAttempt(entry.message)) {
+        activeContinuationHadGoalUpdateAttempt = true;
+      }
       continue;
     }
     if (entry.type !== "custom" || !isGoalEntryType(entry.customType)) {
@@ -637,13 +649,29 @@ function currentGoalState(ctx: ExtensionContext): CurrentGoalState {
       goal = undefined;
       suppressedGoalId = undefined;
       sawGoalStateEntry = true;
+      resetTrackedContinuation();
     } else if (data.goal) {
-      goal = normalizeGoal(data.goal);
+      const nextGoal = normalizeGoal(data.goal);
+      const changedGoal = goal?.goalId !== nextGoal.goalId;
+      goal = nextGoal;
       goalEntryId = entry.id;
       suppressedGoalId = undefined;
       sawGoalStateEntry = true;
+      if (changedGoal) {
+        resetTrackedContinuation();
+      }
+    } else if (data.event === "auto_continue" && data.goalId && data.continuationId) {
+      activeContinuationId = data.continuationId;
+      activeContinuationGoalId = data.goalId;
+      activeContinuationHadGoalUpdateAttempt = false;
     } else if (data.event === "auto_suppressed" && data.goalId) {
-      suppressedGoalId = data.goalId;
+      if (
+        !activeContinuationHadGoalUpdateAttempt ||
+        data.continuationId !== activeContinuationId ||
+        data.goalId !== activeContinuationGoalId
+      ) {
+        suppressedGoalId = data.goalId;
+      }
     }
   }
   if (sawGoalStateEntry) {
@@ -886,6 +914,27 @@ function parseContinuationDetails(data: unknown): Pick<RunningContinuation, "goa
     : undefined;
 }
 
+function messageHasGoalUpdateAttempt(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const candidate = message as { readonly role?: unknown; readonly content?: unknown; readonly stopReason?: unknown };
+  if (candidate.role !== "assistant" || isUnfinishedAssistantMessage(candidate) || !Array.isArray(candidate.content)) {
+    return false;
+  }
+  return candidate.content.some((part) => {
+    if (!part || typeof part !== "object") {
+      return false;
+    }
+    const contentPart = part as { readonly type?: unknown; readonly name?: unknown };
+    return contentPart.type === "toolCall" && contentPart.name === "update_goal";
+  });
+}
+
+function isUnfinishedAssistantMessage(message: { readonly stopReason?: unknown }): boolean {
+  return message.stopReason === "aborted" || message.stopReason === "error";
+}
+
 function readGoalSidecar(ctx: ExtensionContext): Pick<CurrentGoalState, "goal" | "sidecarBaseLeafId"> {
   const parsed = readGoalSidecarData(ctx);
   if (!parsed?.goal) {
@@ -994,10 +1043,6 @@ function normalizeTokenBudget(value: number | undefined): number | null {
     throw new Error("Goal token budget must be a positive integer");
   }
   return value;
-}
-
-function isTokenBudgetExhausted(goal: ThreadGoal): boolean {
-  return goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget;
 }
 
 function continuationPrompt(goal: ThreadGoal): string {
