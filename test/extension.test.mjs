@@ -289,6 +289,18 @@ await test("navigating /tree to reopen a user prompt suppresses auto-continuatio
   assert.equal(h.continuationTriggers(), startTriggers, "editing history does not enqueue a goal turn");
 });
 
+await test("a cancelled/failed compaction does not permanently disable continuation", async () => {
+  const h = harness();
+  await h.runCommand("goal", "survive a failed compaction");
+  await runInjectedTurn(h, { toolResults: [{ toolName: "bash" }] }); // cycle the first arm
+  const before = h.continuationTriggers();
+  // Compaction starts but never emits session_compact (cancelled/failed).
+  await h.runEvent("session_before_compact", { reason: "threshold", willRetry: false });
+  // The next agent run must clear the stuck suppression flag and re-arm.
+  await runInjectedTurn(h, { toolResults: [{ toolName: "bash" }] });
+  assert.equal(h.continuationTriggers(), before + 1, "continuation re-arms after a failed compaction");
+});
+
 await test("per-turn awareness is injected on active-goal turns and survives compaction", async () => {
   const h = harness();
   await h.runCommand("goal", "keep context alive");

@@ -159,6 +159,11 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
   // ---- Agent/turn lifecycle ----
   pi.on("agent_start", async () => {
+    // A new agent run means any compaction window is over. This self-heals the
+    // suppression flag if a compaction was cancelled or failed before emitting
+    // session_compact. An overflow willRetry stays within one run (no new
+    // agent_start), so the intended suppression is preserved.
+    runtime.compacting = false;
     runtime.inAgentRun = true;
     const goal = store.goal;
     runtime.agentGoalId = goal?.goalId;
