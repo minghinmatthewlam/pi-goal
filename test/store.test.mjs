@@ -88,6 +88,35 @@ test("fold ignores non-goal and foreign entries; refold reflects branch switch",
   assert.equal(managed.goal.tokensUsed, 0);
 });
 
+// --- Fold: legacy v1 entries are still recognized on upgrade -------------
+test("legacy pi-goal.goal / pi-gui.goal snapshots fold to the current goal", () => {
+  const legacy = (customType, data) => ({ type: "custom", customType, data });
+  const g = (over) => ({
+    goalId: "legacy1",
+    objective: "old-format goal",
+    status: "active",
+    tokenBudget: null,
+    tokensUsed: 0,
+    timeUsedSeconds: 0,
+    createdAt: now,
+    updatedAt: now,
+    ...over,
+  });
+  const state = foldBranch([
+    legacy("pi-gui.goal", { version: 1, event: "set", goalId: "legacy1", goal: g() }),
+    legacy("pi-goal.goal", { version: 1, event: "set", goalId: "legacy1", goal: g({ tokensUsed: 500, status: "active" }) }),
+  ]);
+  assert.equal(state.goal.goalId, "legacy1");
+  assert.equal(state.goal.tokensUsed, 500);
+  assert.equal(state.goal.status, "active");
+
+  const cleared = foldBranch([
+    legacy("pi-goal.goal", { version: 1, event: "set", goalId: "legacy1", goal: g() }),
+    legacy("pi-goal.goal", { version: 1, event: "clear", goalId: "legacy1" }),
+  ]);
+  assert.equal(cleared.goal, undefined);
+});
+
 // --- Fold: clear resets state -------------------------------------------
 test("goal_cleared resets folded state", () => {
   const state = foldBranch([

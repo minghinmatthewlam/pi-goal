@@ -16,6 +16,10 @@ import {
 } from "./types.ts";
 
 export const GOAL_ENTRY_TYPE = "pi-goal.event";
+// v1 wrote goal snapshots under these custom types. We read them so upgrading
+// does not drop an active goal from an existing session; v2 only ever writes
+// GOAL_ENTRY_TYPE going forward.
+const LEGACY_GOAL_ENTRY_TYPES: readonly string[] = ["pi-goal.goal", "pi-gui.goal"];
 
 const VALID_STATUSES: readonly GoalStatus[] = [
   "active",
@@ -176,16 +180,40 @@ export function applyEvent(state: FoldedState, ev: GoalEvent): FoldedState {
   }
 }
 
+/**
+ * Apply a legacy v1 goal entry. v1 appended a full goal snapshot on every
+ * change (`set`) and a `clear` to drop it, so replaying "last set wins / clear
+ * resets" reconstructs the current goal. Progress ledger detail is not
+ * recoverable from v1 and starts fresh.
+ */
+function applyLegacyEntry(state: FoldedState, data: unknown): FoldedState {
+  if (!data || typeof data !== "object") {
+    return state;
+  }
+  const d = data as Record<string, unknown>;
+  if (d.event === "clear") {
+    return EMPTY_STATE;
+  }
+  if (d.event === "set" && d.goal && typeof d.goal === "object") {
+    return { goal: normalizeGoal(d.goal as ThreadGoal), progress: [], noProgressStreak: 0 };
+  }
+  return state;
+}
+
 /** Fold the current branch into goal state. Only pi-goal events participate. */
 export function foldBranch(entries: Iterable<BranchEntry>): FoldedState {
   let state = EMPTY_STATE;
   for (const entry of entries) {
-    if (entry.type !== "custom" || entry.customType !== GOAL_ENTRY_TYPE) {
+    if (entry.type !== "custom") {
       continue;
     }
-    const ev = parseGoalEvent(entry.data);
-    if (ev) {
-      state = applyEvent(state, ev);
+    if (entry.customType === GOAL_ENTRY_TYPE) {
+      const ev = parseGoalEvent(entry.data);
+      if (ev) {
+        state = applyEvent(state, ev);
+      }
+    } else if (entry.customType && LEGACY_GOAL_ENTRY_TYPES.includes(entry.customType)) {
+      state = applyLegacyEntry(state, entry.data);
     }
   }
   return state;

@@ -134,12 +134,11 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
     runtime.compacting = false;
   });
 
-  // ---- User input takes over any pending auto-continuation ----
-  pi.on("input", async (event) => {
-    if (event.source !== "extension" && runtime.armed && !runtime.armed.consumed) {
-      runtime.armed = undefined;
-    }
-  });
+  // A plain user message does NOT cancel the goal loop: a persistent goal
+  // resumes after the user's turn (explicit /goal pause|clear|complete cancel
+  // it through the command path). Keeping `armed` set means a follow-up trigger
+  // delivered after the user's turn still swaps to a real continuation prompt
+  // rather than firing a bare awareness-only turn.
 
   // ---- Per-turn context injection (awareness + trigger swap) ----
   pi.on("context", async (event) => injectContext(event, store, runtime));
