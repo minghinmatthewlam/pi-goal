@@ -65,15 +65,10 @@ const DEFAULT_MAX_TURNS = 50;
 // the transcript. A completed goal (or no goal) leaves the exit code at 0.
 const HEADLESS_INCOMPLETE_EXIT = 4;
 
-// pi's run mode, exposed on ExtensionContext.mode at runtime (pi >= 0.75).
-// Declared locally because the pinned dev types (0.74) predate the field; the
-// live runtime is 0.80.x, which sets it on every context.
+// pi's run mode, exposed on ExtensionContext.mode (pi >= 0.80.0, per
+// peerDependencies). Declared locally because the type is not re-exported from
+// the package's public entry point.
 type ExtensionMode = "tui" | "rpc" | "json" | "print";
-
-function readMode(ctx: ExtensionContext): ExtensionMode | undefined {
-  const mode = (ctx as { readonly mode?: unknown }).mode;
-  return typeof mode === "string" ? (mode as ExtensionMode) : undefined;
-}
 
 // Modes where pi runs single-shot and the process exit code is meaningful.
 // "tui" and "rpc" are long-lived/interactive; never touch their exit code.
@@ -157,7 +152,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
   // ---- Lifecycle boundaries: fold once, then attempt continuation on resume ----
   const onBoundary = (ctx: ExtensionContext, arm = true): void => {
-    runtime.mode = readMode(ctx);
+    runtime.mode = ctx.mode;
     runtime.armed = undefined;
     runtime.compacting = false;
     store.refold(ctx.sessionManager.getBranch());
@@ -216,7 +211,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
   // ---- Agent/turn lifecycle ----
   pi.on("agent_start", async (_event, ctx) => {
-    runtime.mode = readMode(ctx);
+    runtime.mode = ctx.mode;
     // A new agent run means any compaction window is over. This self-heals the
     // suppression flag if a compaction was cancelled or failed before emitting
     // session_compact. An overflow willRetry stays within one run (no new
