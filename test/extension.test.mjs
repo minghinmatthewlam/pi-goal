@@ -16,7 +16,8 @@ function test(name, fn) {
   });
 }
 
-function harness() {
+function harness(options = {}) {
+  const mode = options.mode ?? "tui";
   const handlers = new Map();
   const commands = new Map();
   const tools = new Map();
@@ -45,7 +46,7 @@ function harness() {
 
   const ctx = {
     ui,
-    mode: "print",
+    mode,
     hasUI: false,
     cwd: "/tmp/pi-goal-test",
     model: { provider: "test", id: "test-model" },
@@ -66,7 +67,7 @@ function harness() {
   const pi = {
     registerCommand: (name, def) => commands.set(name, def),
     registerTool: (tool) => tools.set(tool.name, tool),
-    registerFlag: (name, def) => flags.set(name, def),
+    registerFlag: (name, def) => flags.set(name, { ...def, value: options.flags?.[name] }),
     getFlag: (name) => flags.get(name)?.value,
     on: (name, handler) => {
       const list = handlers.get(name) ?? [];
@@ -311,6 +312,202 @@ await test("per-turn awareness is injected on active-goal turns and survives com
   const last = ctxResult.messages.at(-1);
   assert.equal(last.role, "custom");
   assert.match(last.content, /Active session goal/);
+});
+
+// Run body with process.exitCode isolated: pi-goal sets process.exitCode in
+// headless mode, and we must not let that leak into the test runner's own exit.
+async function withIsolatedExitCode(fn) {
+  const saved = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    return await fn();
+  } finally {
+    process.exitCode = saved;
+  }
+}
+
+// Drive one accounted goal turn that reports real tool progress, from the last
+// armed trigger, and return the folded progress length afterward.
+async function runProgressTurn(h) {
+  await runInjectedTurn(h, { toolResults: [{ toolName: "bash" }], usage: 3 });
+}
+
+await test("headless turn cap: force-blocks the goal and sets exit code 4 after N turns", async () => {
+  await withIsolatedExitCode(async () => {
+    const h = harness({ mode: "print", flags: { "goal-max-turns": "2" } });
+    await h.runCommand("goal", "keep iterating forever");
+    assert.equal(h.continuationTriggers(), 1, "goal creation arms the first continuation");
+
+    await runProgressTurn(h); // turn 1: progress.length -> 1, re-arms
+    assert.equal(h.continuationTriggers(), 2, "under the cap, a second continuation arms");
+    assert.notEqual((await h.runTool("get_goal")).details.goal.status, "blocked");
+
+    await runProgressTurn(h); // turn 2: progress.length -> 2, cap reached at agent_end
+    const goal = (await h.runTool("get_goal")).details.goal;
+    assert.equal(goal.status, "blocked", "hitting the turn cap blocks the goal");
+    assert.equal(h.continuationTriggers(), 2, "no continuation is armed once the cap is hit");
+    assert.equal(process.exitCode, 4, "a turn-capped headless goal reports exit code 4");
+  });
+});
+
+await test("headless turn cap default (50) does not fire early; interactive mode is never capped", async () => {
+  await withIsolatedExitCode(async () => {
+    // Interactive (tui) run with a cap of 1 must NOT block: the cap is headless-only.
+    const interactive = harness({ mode: "tui", flags: { "goal-max-turns": "1" } });
+    await interactive.runCommand("goal", "long interactive goal");
+    await runProgressTurn(interactive);
+    await runProgressTurn(interactive);
+    await runProgressTurn(interactive);
+    assert.equal((await interactive.runTool("get_goal")).details.goal.status, "active", "interactive runs ignore the cap");
+    assert.equal(process.exitCode, undefined, "interactive mode never sets a headless exit code");
+
+    // Headless run with the default cap stays active well before 50 turns.
+    const headless = harness({ mode: "print" });
+    await headless.runCommand("goal", "short headless goal");
+    await runProgressTurn(headless);
+    await runProgressTurn(headless);
+    assert.equal((await headless.runTool("get_goal")).details.goal.status, "active", "default cap does not fire at 2 turns");
+  });
+});
+
+await test("headless exit code: budget_limited reports 4, completion stays 0", async () => {
+  await withIsolatedExitCode(async () => {
+    const budget = harness({ mode: "print" });
+    await budget.runEvent("agent_start");
+    await budget.runTool("create_goal", { objective: "summarize", token_budget: 10 });
+    const overspend = assistant("working", { usage: { totalTokens: 50, cost: {} } });
+    await budget.runEvent("turn_end", { turnIndex: 0, message: overspend, toolResults: [{ toolName: "bash" }] });
+    assert.equal((await budget.runTool("get_goal")).details.goal.status, "budget_limited");
+    assert.equal(process.exitCode, 4, "budget_limited reports the incomplete exit code");
+
+    process.exitCode = undefined;
+    const done = harness({ mode: "print" });
+    await done.runCommand("goal", "finish the thing");
+    await done.runEvent("agent_start");
+    const trigger = done.triggerMessagesFrom(done.sent.length - 1)[0];
+    await done.runEvent("context", { messages: [trigger] });
+    await done.runTool("update_goal", { status: "complete" });
+    await done.runEvent("agent_end", { messages: [assistant("done")] });
+    assert.equal((await done.runTool("get_goal")).details.goal.status, "complete");
+    assert.equal(process.exitCode, undefined, "a completed headless goal leaves the exit code at 0");
+  });
+});
+
+await test("headless resume does not arm a boundary continuation (avoids the nested-run race)", async () => {
+  const now = Date.now();
+  const seedActiveGoal = (h) =>
+    h.entries.push({
+      id: "seed",
+      type: "custom",
+      customType: "pi-goal.event",
+      data: {
+        v: 1,
+        event: "goal_created",
+        goal: {
+          goalId: "g1",
+          objective: "resume me",
+          status: "active",
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+
+  const headless = harness({ mode: "print" });
+  seedActiveGoal(headless);
+  await headless.runEvent("session_start", { reason: "resume" });
+  assert.equal(headless.continuationTriggers(), 0, "headless resume must not start a boundary continuation");
+  // agent_end after the initial prompt's run still drives the loop.
+  await headless.runEvent("agent_start");
+  await headless.runEvent("turn_end", { turnIndex: 0, message: assistant("thinking"), toolResults: [{ toolName: "bash" }] });
+  await headless.runEvent("agent_end", { messages: [assistant("thinking")] });
+  assert.equal(headless.continuationTriggers(), 1, "agent_end arming still continues a headless goal");
+
+  const interactive = harness({ mode: "tui" });
+  seedActiveGoal(interactive);
+  await interactive.runEvent("session_start", { reason: "resume" });
+  assert.equal(interactive.continuationTriggers(), 1, "interactive resume still arms on a boundary");
+});
+
+await test("headless resume still terminalizes an over-budget goal (stop-guard), without scheduling a turn", async () => {
+  await withIsolatedExitCode(async () => {
+    const now = Date.now();
+    const h = harness({ mode: "print" });
+    h.entries.push({
+      id: "seed",
+      type: "custom",
+      customType: "pi-goal.event",
+      data: {
+        v: 1,
+        event: "goal_created",
+        goal: {
+          goalId: "g1",
+          objective: "already spent",
+          status: "active",
+          tokenBudget: 100,
+          tokensUsed: 5000,
+          timeUsedSeconds: 10,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    await h.runEvent("session_start", { reason: "resume" });
+    const goal = (await h.runTool("get_goal")).details.goal;
+    assert.equal(goal.status, "budget_limited", "the over-budget stop-guard still runs at a headless boundary");
+    assert.equal(h.continuationTriggers(), 0, "no continuation trigger at a headless boundary");
+    assert.equal(h.budgetTriggers(), 0, "no nested wrap-up turn is scheduled at a headless boundary");
+    assert.equal(process.exitCode, 4, "the terminalized over-budget goal reports exit code 4");
+  });
+});
+
+await test("headless exit code: refolding a prior terminal goal does not poison a fresh run", async () => {
+  await withIsolatedExitCode(async () => {
+    const now = Date.now();
+    const h = harness({ mode: "print" });
+    // A session that already contains a budget_limited goal from a previous run.
+    h.entries.push({
+      id: "seed",
+      type: "custom",
+      customType: "pi-goal.event",
+      data: {
+        v: 1,
+        event: "goal_created",
+        goal: {
+          goalId: "g1",
+          objective: "old goal",
+          status: "budget_limited",
+          tokenBudget: 100,
+          tokensUsed: 500,
+          timeUsedSeconds: 5,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    // Opening the session (refold) must not set the process exit code: this run
+    // did not drive the goal terminal; the prior run already reported it.
+    await h.runEvent("session_start", { reason: "resume" });
+    assert.equal(process.exitCode, undefined, "refolding a prior terminal goal leaves the exit code at 0");
+  });
+});
+
+await test("headless exit code: model-blocked goal reports 4", async () => {
+  await withIsolatedExitCode(async () => {
+    const h = harness({ mode: "print" });
+    await h.runCommand("goal", "do the thing");
+    await h.runEvent("agent_start");
+    const trigger = h.triggerMessagesFrom(h.sent.length - 1)[0];
+    await h.runEvent("context", { messages: [trigger] });
+    const errored = assistant("", { stopReason: "error", errorMessage: "the server exploded" });
+    await h.runEvent("turn_end", { turnIndex: 0, message: errored, toolResults: [] });
+    await h.runEvent("agent_end", { messages: [errored] });
+    assert.equal((await h.runTool("get_goal")).details.goal.status, "blocked");
+    assert.equal(process.exitCode, 4, "a blocked headless goal reports exit code 4");
+  });
 });
 
 console.log(`\n${passed} extension tests passed`);

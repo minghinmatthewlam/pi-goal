@@ -50,7 +50,31 @@ const TRIGGER_CONTENT = "Goal continuation requested.";
 const GOAL_STATUS_KEY = "goal";
 const GOAL_WIDGET_KEY = "pi-goal";
 const STATE_FILE_FLAG = "goal-state-file";
+const MAX_TURNS_FLAG = "goal-max-turns";
 const MAX_OBJECTIVE_LENGTH = 4000;
+
+// Belt-and-suspenders cap on accounted goal turns in headless (print/json) mode.
+// Existing stop-guards (budget, turn errors, 3-turn no-progress audit) are the
+// primary runaway protection; this bounds an otherwise-unbounded headless loop.
+const DEFAULT_MAX_TURNS = 50;
+
+// Exit code the headless process reports when the goal loop ends on any
+// non-complete terminal status (blocked | budget_limited | usage_limited,
+// including the turn-cap block). Distinct from a generic error (1) so an
+// orchestrator can tell "stopped incomplete" from "crashed" without parsing
+// the transcript. A completed goal (or no goal) leaves the exit code at 0.
+const HEADLESS_INCOMPLETE_EXIT = 4;
+
+// pi's run mode, exposed on ExtensionContext.mode (pi >= 0.80.0, per
+// peerDependencies). Declared locally because the type is not re-exported from
+// the package's public entry point.
+type ExtensionMode = "tui" | "rpc" | "json" | "print";
+
+// Modes where pi runs single-shot and the process exit code is meaningful.
+// "tui" and "rpc" are long-lived/interactive; never touch their exit code.
+function isHeadlessMode(mode: ExtensionMode | undefined): boolean {
+  return mode === "print" || mode === "json";
+}
 
 type TriggerKind = "continuation" | "budget";
 
@@ -70,6 +94,9 @@ interface Runtime {
   // Set in session_before_tree when navigating to reopen/edit an earlier
   // prompt, so session_tree does not auto-continue while the user edits history.
   suppressTreeContinuation: boolean;
+  // The current run mode, captured from ctx on every boundary/agent_start. Used
+  // to scope the headless turn cap and exit-code signaling to print/json runs.
+  mode: ExtensionMode | undefined;
 }
 
 interface TriggerDetails {
@@ -86,15 +113,31 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
     agentGoalId: undefined,
     agentGoalWasActive: false,
     suppressTreeContinuation: false,
+    mode: undefined,
   };
 
   const store = new GoalStore(
     (event: GoalEvent) => pi.appendEntry(GOAL_ENTRY_TYPE, event),
-    (state) => writeStateFile(pi, state),
+    (state, source) => {
+      writeStateFile(pi, state);
+      // Reflect a terminal-incomplete goal in the process exit code so a headless
+      // orchestrator can distinguish "done" from "stopped incomplete". Only act
+      // on a real transition this run ("commit"); a "refold" merely loads
+      // persisted state, so an old terminal goal from a prior run must not
+      // poison a fresh headless invocation's exit code.
+      if (source === "commit") {
+        updateHeadlessExitCode(runtime, state.goal?.status);
+      }
+    },
   );
 
   pi.registerFlag(STATE_FILE_FLAG, {
     description: "Write folded goal state as JSON to this path on every change.",
+    type: "string",
+  });
+
+  pi.registerFlag(MAX_TURNS_FLAG, {
+    description: `Headless (pi -p) only: cap on accounted goal turns before the loop force-blocks the goal (default ${DEFAULT_MAX_TURNS}).`,
     type: "string",
   });
 
@@ -109,12 +152,20 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
   // ---- Lifecycle boundaries: fold once, then attempt continuation on resume ----
   const onBoundary = (ctx: ExtensionContext, arm = true): void => {
+    runtime.mode = ctx.mode;
     runtime.armed = undefined;
     runtime.compacting = false;
     store.refold(ctx.sessionManager.getBranch());
     syncUi(ctx, store);
+    // In headless (print/json) mode the agent is idle at a boundary, so a
+    // continuation trigger would start a *nested* agent run that races print
+    // mode's initial prompt ("Agent is already processing"). Pass schedule:false
+    // so a boundary still runs the stop-guards (terminalizing an already-
+    // exhausted goal) but never starts a turn; headless continuation is driven
+    // by agent_end arming, which is race-free. Interactive/RPC schedule normally
+    // so a persisted goal keeps going when the app opens idle.
     if (arm) {
-      armContinuation(pi, store, runtime, ctx);
+      armContinuation(pi, store, runtime, ctx, { schedule: !isHeadlessMode(runtime.mode) });
     }
   };
 
@@ -158,7 +209,8 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
   pi.on("context", async (event) => injectContext(event, store, runtime));
 
   // ---- Agent/turn lifecycle ----
-  pi.on("agent_start", async () => {
+  pi.on("agent_start", async (_event, ctx) => {
+    runtime.mode = ctx.mode;
     // A new agent run means any compaction window is over. This self-heals the
     // suppression flag if a compaction was cancelled or failed before emitting
     // session_compact. An overflow willRetry stays within one run (no new
@@ -256,18 +308,59 @@ function awarenessMessage(goal: ThreadGoal, state: FoldedState): GoalMessage {
 // Continuation + accounting
 // ---------------------------------------------------------------------------
 
-function armContinuation(pi: ExtensionAPI, store: GoalStore, runtime: Runtime, ctx: ExtensionContext): void {
+/**
+ * Advance the active goal at a would-continue point.
+ *
+ * `schedule` separates state terminalization (stop-guards that must run at every
+ * boundary) from scheduling the next continuation turn (sending a trigger).
+ * Headless (print/json) *idle boundaries* pass `schedule: false`: at an idle
+ * boundary a trigger would start a nested agent run that races print mode's
+ * initial prompt ("Agent is already processing"), so those boundaries only
+ * terminalize an already-exhausted goal and never start a turn. agent_end and
+ * interactive boundaries schedule normally (the followUp enqueued at agent_end
+ * is race-free).
+ */
+function armContinuation(
+  pi: ExtensionAPI,
+  store: GoalStore,
+  runtime: Runtime,
+  ctx: ExtensionContext,
+  options: { readonly schedule?: boolean } = {},
+): void {
+  const schedule = options.schedule ?? true;
   const goal = store.goal;
   if (!goal || goal.status !== "active" || runtime.armed || runtime.compacting) {
     return;
   }
+  // Headless turn cap: in print/json mode the loop would otherwise continue
+  // until the model completes or another stop-guard fires. Once the goal has
+  // been accounted for at least the configured number of turns, force it
+  // blocked instead of arming another continuation. Only relevant when we would
+  // actually schedule a continuation; interactive/RPC runs are never capped.
+  if (schedule && isHeadlessMode(runtime.mode)) {
+    const maxTurns = getMaxTurns(pi);
+    const turns = store.folded.progress.length;
+    if (turns >= maxTurns) {
+      store.changeStatus(goal.goalId, "blocked", Date.now(), `headless turn cap of ${maxTurns} reached`);
+      syncUi(ctx, store);
+      return;
+    }
+  }
   if (isOverBudget(goal)) {
     // An active goal already at/over budget (e.g. loaded from persisted or
     // legacy state on resume) must not sit active forever: move it to
-    // budget_limited and send the one-time wrap-up, mirroring accountTurn.
+    // budget_limited, mirroring accountTurn. This is a stop-guard, so it runs
+    // even at headless boundaries; the one-time wrap-up is a scheduled turn, so
+    // it is only armed when scheduling is allowed.
     store.changeStatus(goal.goalId, "budget_limited", Date.now(), "token budget reached");
     syncUi(ctx, store);
-    armBudgetWrapup(pi, runtime, goal.goalId);
+    if (schedule) {
+      armBudgetWrapup(pi, runtime, goal.goalId);
+    }
+    return;
+  }
+  if (!schedule) {
+    // Headless idle boundary: terminalize only, never start a nested run.
     return;
   }
   const model = ctx.model;
@@ -287,6 +380,33 @@ function armBudgetWrapup(pi: ExtensionAPI, runtime: Runtime, goalId: string): vo
   const id = randomUUID();
   runtime.armed = { id, kind: "budget", goalId, consumed: false };
   sendTrigger(pi, id, "budget", goalId);
+}
+
+/** Parse the --goal-max-turns flag, falling back to the default for absent/invalid values. */
+function getMaxTurns(pi: ExtensionAPI): number {
+  const raw = pi.getFlag(MAX_TURNS_FLAG);
+  if (typeof raw !== "string") {
+    return DEFAULT_MAX_TURNS;
+  }
+  const parsed = Number.parseInt(raw.trim(), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_TURNS;
+}
+
+/**
+ * In headless (print/json) mode, set the process exit code to reflect a goal
+ * loop that ended on a non-complete terminal status. `process.exitCode` is set
+ * (never `process.exit()`), so pi's normal shutdown/flush still runs and the
+ * code is honored when the event loop drains. pi's print mode only overrides
+ * the exit code when its own return value is non-zero (a turn error/abort), so
+ * this survives a clean wrap-up turn. Interactive/RPC modes are never touched.
+ */
+function updateHeadlessExitCode(runtime: Runtime, status: GoalStatus | undefined): void {
+  if (!isHeadlessMode(runtime.mode) || status === undefined) {
+    return;
+  }
+  if (status === "blocked" || status === "budget_limited" || status === "usage_limited") {
+    process.exitCode = HEADLESS_INCOMPLETE_EXIT;
+  }
 }
 
 function sendTrigger(pi: ExtensionAPI, id: string, kind: TriggerKind, goalId: string): void {
