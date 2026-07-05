@@ -1,6 +1,6 @@
 {
   "name": "@matthewlam/pi-goal",
-  "version": "0.3.0-dev",
+  "version": "0.3.0",
   "description": "Persistent goal mode for pi with automatic idle continuation",
   "type": "module",
   "keywords": [
