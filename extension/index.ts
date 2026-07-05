@@ -64,6 +64,7 @@ interface GoalExtensionState {
   activeTurnGoalWasActive: boolean;
   suppressedGoalId: string | undefined;
   continuationScheduled: boolean;
+  continuationTimer: ReturnType<typeof setTimeout> | undefined;
   pendingTreeEditorGoalId: string | undefined;
   treeEditorGoalId: string | undefined;
   uiRefreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -93,6 +94,7 @@ export default function piGoalExtension(pi: ExtensionAPI) {
     activeTurnGoalWasActive: false,
     suppressedGoalId: undefined,
     continuationScheduled: false,
+    continuationTimer: undefined,
     pendingTreeEditorGoalId: undefined,
     treeEditorGoalId: undefined,
     uiRefreshTimer: undefined,
@@ -114,6 +116,11 @@ export default function piGoalExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    // The session (and this ctx) is invalidated immediately after shutdown
+    // handlers run. Cancel any deferred work that captured this ctx so it never
+    // fires against a stale session (e.g. the idle-continuation timer touching
+    // ctx.ui/ctx.sessionManager after a headless run exits).
+    cancelScheduledContinuation(state);
     stopGoalUiRefresh(state);
   });
 
@@ -603,12 +610,21 @@ function scheduleGoalContinuation(pi: ExtensionAPI, state: GoalExtensionState, c
     return;
   }
   state.continuationScheduled = true;
-  setTimeout(() => {
+  state.continuationTimer = setTimeout(() => {
     state.continuationScheduled = false;
+    state.continuationTimer = undefined;
     void maybeContinueGoal(pi, state, ctx).catch((error) => {
       ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
     });
   }, 0);
+}
+
+function cancelScheduledContinuation(state: GoalExtensionState): void {
+  if (state.continuationTimer) {
+    clearTimeout(state.continuationTimer);
+    state.continuationTimer = undefined;
+  }
+  state.continuationScheduled = false;
 }
 
 function currentGoal(ctx: ExtensionContext): ThreadGoal | undefined {
