@@ -158,15 +158,14 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
     store.refold(ctx.sessionManager.getBranch());
     syncUi(ctx, store);
     // In headless (print/json) mode the agent is idle at a boundary, so a
-    // continuation trigger would start a *nested* agent run (triggerTurn while
-    // not streaming). When print mode is about to deliver its initial prompt,
-    // that nested run collides with it ("Agent is already processing"). Headless
-    // continuation is instead driven entirely by agent_end arming (a followUp
-    // enqueued mid-run and drained by the host's post-run loop), which is
-    // race-free. Interactive/RPC sessions still arm on resume so a persisted
-    // goal keeps going when the app opens idle.
-    if (arm && !isHeadlessMode(runtime.mode)) {
-      armContinuation(pi, store, runtime, ctx);
+    // continuation trigger would start a *nested* agent run that races print
+    // mode's initial prompt ("Agent is already processing"). Pass schedule:false
+    // so a boundary still runs the stop-guards (terminalizing an already-
+    // exhausted goal) but never starts a turn; headless continuation is driven
+    // by agent_end arming, which is race-free. Interactive/RPC schedule normally
+    // so a persisted goal keeps going when the app opens idle.
+    if (arm) {
+      armContinuation(pi, store, runtime, ctx, { schedule: !isHeadlessMode(runtime.mode) });
     }
   };
 
@@ -309,7 +308,26 @@ function awarenessMessage(goal: ThreadGoal, state: FoldedState): GoalMessage {
 // Continuation + accounting
 // ---------------------------------------------------------------------------
 
-function armContinuation(pi: ExtensionAPI, store: GoalStore, runtime: Runtime, ctx: ExtensionContext): void {
+/**
+ * Advance the active goal at a would-continue point.
+ *
+ * `schedule` separates state terminalization (stop-guards that must run at every
+ * boundary) from scheduling the next continuation turn (sending a trigger).
+ * Headless (print/json) *idle boundaries* pass `schedule: false`: at an idle
+ * boundary a trigger would start a nested agent run that races print mode's
+ * initial prompt ("Agent is already processing"), so those boundaries only
+ * terminalize an already-exhausted goal and never start a turn. agent_end and
+ * interactive boundaries schedule normally (the followUp enqueued at agent_end
+ * is race-free).
+ */
+function armContinuation(
+  pi: ExtensionAPI,
+  store: GoalStore,
+  runtime: Runtime,
+  ctx: ExtensionContext,
+  options: { readonly schedule?: boolean } = {},
+): void {
+  const schedule = options.schedule ?? true;
   const goal = store.goal;
   if (!goal || goal.status !== "active" || runtime.armed || runtime.compacting) {
     return;
@@ -317,9 +335,9 @@ function armContinuation(pi: ExtensionAPI, store: GoalStore, runtime: Runtime, c
   // Headless turn cap: in print/json mode the loop would otherwise continue
   // until the model completes or another stop-guard fires. Once the goal has
   // been accounted for at least the configured number of turns, force it
-  // blocked instead of arming another continuation. Interactive/RPC runs are
-  // driven by a human and are never capped.
-  if (isHeadlessMode(runtime.mode)) {
+  // blocked instead of arming another continuation. Only relevant when we would
+  // actually schedule a continuation; interactive/RPC runs are never capped.
+  if (schedule && isHeadlessMode(runtime.mode)) {
     const maxTurns = getMaxTurns(pi);
     const turns = store.folded.progress.length;
     if (turns >= maxTurns) {
@@ -331,10 +349,18 @@ function armContinuation(pi: ExtensionAPI, store: GoalStore, runtime: Runtime, c
   if (isOverBudget(goal)) {
     // An active goal already at/over budget (e.g. loaded from persisted or
     // legacy state on resume) must not sit active forever: move it to
-    // budget_limited and send the one-time wrap-up, mirroring accountTurn.
+    // budget_limited, mirroring accountTurn. This is a stop-guard, so it runs
+    // even at headless boundaries; the one-time wrap-up is a scheduled turn, so
+    // it is only armed when scheduling is allowed.
     store.changeStatus(goal.goalId, "budget_limited", Date.now(), "token budget reached");
     syncUi(ctx, store);
-    armBudgetWrapup(pi, runtime, goal.goalId);
+    if (schedule) {
+      armBudgetWrapup(pi, runtime, goal.goalId);
+    }
+    return;
+  }
+  if (!schedule) {
+    // Headless idle boundary: terminalize only, never start a nested run.
     return;
   }
   const model = ctx.model;

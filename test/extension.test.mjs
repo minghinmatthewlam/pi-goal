@@ -432,6 +432,38 @@ await test("headless resume does not arm a boundary continuation (avoids the nes
   assert.equal(interactive.continuationTriggers(), 1, "interactive resume still arms on a boundary");
 });
 
+await test("headless resume still terminalizes an over-budget goal (stop-guard), without scheduling a turn", async () => {
+  await withIsolatedExitCode(async () => {
+    const now = Date.now();
+    const h = harness({ mode: "print" });
+    h.entries.push({
+      id: "seed",
+      type: "custom",
+      customType: "pi-goal.event",
+      data: {
+        v: 1,
+        event: "goal_created",
+        goal: {
+          goalId: "g1",
+          objective: "already spent",
+          status: "active",
+          tokenBudget: 100,
+          tokensUsed: 5000,
+          timeUsedSeconds: 10,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    await h.runEvent("session_start", { reason: "resume" });
+    const goal = (await h.runTool("get_goal")).details.goal;
+    assert.equal(goal.status, "budget_limited", "the over-budget stop-guard still runs at a headless boundary");
+    assert.equal(h.continuationTriggers(), 0, "no continuation trigger at a headless boundary");
+    assert.equal(h.budgetTriggers(), 0, "no nested wrap-up turn is scheduled at a headless boundary");
+    assert.equal(process.exitCode, 4, "the terminalized over-budget goal reports exit code 4");
+  });
+});
+
 await test("headless exit code: refolding a prior terminal goal does not poison a fresh run", async () => {
   await withIsolatedExitCode(async () => {
     const now = Date.now();
