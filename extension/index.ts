@@ -67,6 +67,9 @@ interface Runtime {
   inAgentRun: boolean;
   agentGoalId: string | undefined;
   agentGoalWasActive: boolean;
+  // Set in session_before_tree when navigating to reopen/edit an earlier
+  // prompt, so session_tree does not auto-continue while the user edits history.
+  suppressTreeContinuation: boolean;
 }
 
 interface TriggerDetails {
@@ -82,6 +85,7 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
     inAgentRun: false,
     agentGoalId: undefined,
     agentGoalWasActive: false,
+    suppressTreeContinuation: false,
   };
 
   const store = new GoalStore(
@@ -104,19 +108,29 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
   pi.registerTool(createUpdateGoalTool(store, runtime));
 
   // ---- Lifecycle boundaries: fold once, then attempt continuation on resume ----
-  const onBoundary = (ctx: ExtensionContext): void => {
+  const onBoundary = (ctx: ExtensionContext, arm = true): void => {
     runtime.armed = undefined;
     runtime.compacting = false;
     store.refold(ctx.sessionManager.getBranch());
     syncUi(ctx, store);
-    if (!runtime.compacting) {
+    if (arm) {
       armContinuation(pi, store, runtime, ctx);
     }
   };
 
   pi.on("session_start", async (_event, ctx) => onBoundary(ctx));
   pi.on("model_select", async (_event, ctx) => onBoundary(ctx));
-  pi.on("session_tree", async (_event, ctx) => onBoundary(ctx));
+
+  pi.on("session_before_tree", async (event, ctx) => {
+    const goal = store.goal;
+    const target = ctx.sessionManager.getEntry(event.preparation.targetId);
+    runtime.suppressTreeContinuation = goal?.status === "active" && isTreeEditorTarget(target);
+  });
+  pi.on("session_tree", async (_event, ctx) => {
+    const arm = !runtime.suppressTreeContinuation;
+    runtime.suppressTreeContinuation = false;
+    onBoundary(ctx, arm);
+  });
 
   pi.on("session_shutdown", async () => {
     // No timers to cancel (the loop is timerless), so nothing captures ctx past
@@ -243,6 +257,12 @@ function armContinuation(pi: ExtensionAPI, store: GoalStore, runtime: Runtime, c
     return;
   }
   if (isOverBudget(goal)) {
+    // An active goal already at/over budget (e.g. loaded from persisted or
+    // legacy state on resume) must not sit active forever: move it to
+    // budget_limited and send the one-time wrap-up, mirroring accountTurn.
+    store.changeStatus(goal.goalId, "budget_limited", Date.now(), "token budget reached");
+    syncUi(ctx, store);
+    armBudgetWrapup(pi, runtime, goal.goalId);
     return;
   }
   const model = ctx.model;
@@ -332,7 +352,13 @@ async function handleGoalCommand(
       ctx.ui.notify("No goal is currently set", "error");
       return;
     }
-    runtime.armed = undefined;
+    if (status === "active") {
+      runtime.armed = undefined;
+    } else {
+      // pause / complete / blocked: abort an in-flight continuation turn so it
+      // stops mutating state after the user explicitly stopped the goal.
+      cancelContinuation(runtime, ctx);
+    }
     store.changeStatus(goal.goalId, status, now);
     ctx.ui.notify(`Goal ${status}: ${truncate(goal.objective, 140)}`, "info");
     syncUi(ctx, store);
@@ -343,7 +369,7 @@ async function handleGoalCommand(
 
   switch (command) {
     case "clear":
-      runtime.armed = undefined;
+      cancelContinuation(runtime, ctx);
       store.clear(now);
       syncUi(ctx, store);
       ctx.ui.notify(goal ? "Goal cleared" : "No goal is currently set", "info");
@@ -377,11 +403,32 @@ async function handleGoalCommand(
       return;
     }
   }
-  runtime.armed = undefined;
+  cancelContinuation(runtime, ctx);
   store.create(makeGoalSnapshot(objective, null, now));
   ctx.ui.notify(`Goal active: ${truncate(objective, 140)}`, "info");
   syncUi(ctx, store);
   armContinuation(pi, store, runtime, ctx);
+}
+
+/**
+ * Drop any armed continuation. If a continuation turn is actually running
+ * (its trigger was consumed into the live turn), abort that turn too so the
+ * agent stops working immediately.
+ */
+function cancelContinuation(runtime: Runtime, ctx: ExtensionContext): void {
+  const wasRunning = runtime.armed?.consumed === true;
+  runtime.armed = undefined;
+  if (wasRunning && ctx.signal && !ctx.signal.aborted) {
+    ctx.abort();
+  }
+}
+
+function isTreeEditorTarget(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") {
+    return false;
+  }
+  const candidate = entry as { readonly type?: unknown; readonly message?: { readonly role?: unknown } };
+  return candidate.type === "custom_message" || (candidate.type === "message" && candidate.message?.role === "user");
 }
 
 function createGetGoalTool(store: GoalStore) {

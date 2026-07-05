@@ -250,6 +250,45 @@ await test("update_goal contract: strict schema, active-only", async () => {
   assert.equal(paused.isError, true, "cannot complete a non-active goal via the tool");
 });
 
+await test("resuming an over-budget active goal moves it to budget_limited (no stranded active loop)", async () => {
+  const h = harness();
+  const now = Date.now();
+  h.entries.push({
+    id: "seed",
+    type: "custom",
+    customType: "pi-goal.event",
+    data: {
+      v: 1,
+      event: "goal_created",
+      goal: {
+        goalId: "g1",
+        objective: "already spent",
+        status: "active",
+        tokenBudget: 100,
+        tokensUsed: 5000,
+        timeUsedSeconds: 10,
+        createdAt: now,
+        updatedAt: now,
+      },
+    },
+  });
+  await h.runEvent("session_start", { reason: "resume" });
+  const goal = (await h.runTool("get_goal")).details.goal;
+  assert.equal(goal.status, "budget_limited");
+  assert.equal(h.continuationTriggers(), 0, "over-budget goal never arms a continuation");
+  assert.equal(h.budgetTriggers(), 1, "it arms the one-time wrap-up instead");
+});
+
+await test("navigating /tree to reopen a user prompt suppresses auto-continuation", async () => {
+  const h = harness();
+  await h.runCommand("goal", "keep working");
+  const startTriggers = h.continuationTriggers();
+  h.entries.push({ id: "u1", type: "message", message: { role: "user", content: "earlier prompt" } });
+  await h.runEvent("session_before_tree", { preparation: { targetId: "u1" } });
+  await h.runEvent("session_tree", { newLeafId: "u1", oldLeafId: null });
+  assert.equal(h.continuationTriggers(), startTriggers, "editing history does not enqueue a goal turn");
+});
+
 await test("per-turn awareness is injected on active-goal turns and survives compaction", async () => {
   const h = harness();
   await h.runCommand("goal", "keep context alive");
