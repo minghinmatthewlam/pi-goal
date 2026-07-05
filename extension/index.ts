@@ -247,7 +247,11 @@ function armContinuation(pi: ExtensionAPI, store: GoalStore, runtime: Runtime, c
     return;
   }
   const model = ctx.model;
-  if (!model || !ctx.modelRegistry.hasConfiguredAuth(model) || !ctx.isIdle() || ctx.hasPendingMessages()) {
+  // Do not gate on ctx.isIdle(): at agent_end the run is ending but not yet
+  // marked idle. The trigger is delivered as a followUp with triggerTurn, so
+  // the host fires it once the agent actually reaches idle. Still defer to any
+  // queued user input.
+  if (!model || !ctx.modelRegistry.hasConfiguredAuth(model) || ctx.hasPendingMessages()) {
     return;
   }
   const id = randomUUID();
