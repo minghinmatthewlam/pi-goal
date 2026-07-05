@@ -9,7 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run typecheck && node test/goal-extension-smoke.mjs"
+    "test": "npm run typecheck && node test/store.test.mjs && node test/extension.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
