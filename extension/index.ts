@@ -123,12 +123,16 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
 
   const store = new GoalStore(
     (event: GoalEvent) => pi.appendEntry(GOAL_ENTRY_TYPE, event),
-    (state) => {
+    (state, source) => {
       writeStateFile(pi, state);
       // Reflect a terminal-incomplete goal in the process exit code so a headless
-      // orchestrator can distinguish "done" from "stopped incomplete". Terminal
-      // statuses are sticky, so setting this once on transition is sufficient.
-      updateHeadlessExitCode(runtime, state.goal?.status);
+      // orchestrator can distinguish "done" from "stopped incomplete". Only act
+      // on a real transition this run ("commit"); a "refold" merely loads
+      // persisted state, so an old terminal goal from a prior run must not
+      // poison a fresh headless invocation's exit code.
+      if (source === "commit") {
+        updateHeadlessExitCode(runtime, state.goal?.status);
+      }
     },
   );
 

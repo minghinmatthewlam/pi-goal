@@ -306,7 +306,14 @@ export function buildProgressNote(toolResults: readonly ToolResultLike[]): {
 // ---------------------------------------------------------------------------
 
 export type AppendGoalEvent = (data: GoalEvent) => void;
-export type StateListener = (state: FoldedState) => void;
+/**
+ * `source` distinguishes a `commit` (this process actively changed goal state
+ * this run) from a `refold` (persisted branch state was loaded at a lifecycle
+ * boundary). Side effects that must reflect only the current run — e.g. the
+ * headless exit code — act on `commit` and ignore `refold`.
+ */
+export type StateChangeSource = "commit" | "refold";
+export type StateListener = (state: FoldedState, source: StateChangeSource) => void;
 
 /**
  * Owns the folded state. Fold once per lifecycle boundary via `refold`, then
@@ -334,14 +341,14 @@ export class GoalStore {
   /** Rebuild the cache from the current branch (a lifecycle boundary). */
   refold(entries: Iterable<BranchEntry>): FoldedState {
     this.state = foldBranch(entries);
-    this.onChange?.(this.state);
+    this.onChange?.(this.state, "refold");
     return this.state;
   }
 
   private commit(ev: GoalEvent): FoldedState {
     this.append(ev);
     this.state = applyEvent(this.state, ev);
-    this.onChange?.(this.state);
+    this.onChange?.(this.state, "commit");
     return this.state;
   }
 

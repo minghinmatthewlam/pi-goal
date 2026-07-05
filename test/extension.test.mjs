@@ -432,6 +432,37 @@ await test("headless resume does not arm a boundary continuation (avoids the nes
   assert.equal(interactive.continuationTriggers(), 1, "interactive resume still arms on a boundary");
 });
 
+await test("headless exit code: refolding a prior terminal goal does not poison a fresh run", async () => {
+  await withIsolatedExitCode(async () => {
+    const now = Date.now();
+    const h = harness({ mode: "print" });
+    // A session that already contains a budget_limited goal from a previous run.
+    h.entries.push({
+      id: "seed",
+      type: "custom",
+      customType: "pi-goal.event",
+      data: {
+        v: 1,
+        event: "goal_created",
+        goal: {
+          goalId: "g1",
+          objective: "old goal",
+          status: "budget_limited",
+          tokenBudget: 100,
+          tokensUsed: 500,
+          timeUsedSeconds: 5,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    // Opening the session (refold) must not set the process exit code: this run
+    // did not drive the goal terminal; the prior run already reported it.
+    await h.runEvent("session_start", { reason: "resume" });
+    assert.equal(process.exitCode, undefined, "refolding a prior terminal goal leaves the exit code at 0");
+  });
+});
+
 await test("headless exit code: model-blocked goal reports 4", async () => {
   await withIsolatedExitCode(async () => {
     const h = harness({ mode: "print" });
