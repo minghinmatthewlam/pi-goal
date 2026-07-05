@@ -158,7 +158,15 @@ export default function piGoalExtension(pi: ExtensionAPI): void {
     runtime.compacting = false;
     store.refold(ctx.sessionManager.getBranch());
     syncUi(ctx, store);
-    if (arm) {
+    // In headless (print/json) mode the agent is idle at a boundary, so a
+    // continuation trigger would start a *nested* agent run (triggerTurn while
+    // not streaming). When print mode is about to deliver its initial prompt,
+    // that nested run collides with it ("Agent is already processing"). Headless
+    // continuation is instead driven entirely by agent_end arming (a followUp
+    // enqueued mid-run and drained by the host's post-run loop), which is
+    // race-free. Interactive/RPC sessions still arm on resume so a persisted
+    // goal keeps going when the app opens idle.
+    if (arm && !isHeadlessMode(runtime.mode)) {
       armContinuation(pi, store, runtime, ctx);
     }
   };

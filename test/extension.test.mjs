@@ -393,6 +393,45 @@ await test("headless exit code: budget_limited reports 4, completion stays 0", a
   });
 });
 
+await test("headless resume does not arm a boundary continuation (avoids the nested-run race)", async () => {
+  const now = Date.now();
+  const seedActiveGoal = (h) =>
+    h.entries.push({
+      id: "seed",
+      type: "custom",
+      customType: "pi-goal.event",
+      data: {
+        v: 1,
+        event: "goal_created",
+        goal: {
+          goalId: "g1",
+          objective: "resume me",
+          status: "active",
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+
+  const headless = harness({ mode: "print" });
+  seedActiveGoal(headless);
+  await headless.runEvent("session_start", { reason: "resume" });
+  assert.equal(headless.continuationTriggers(), 0, "headless resume must not start a boundary continuation");
+  // agent_end after the initial prompt's run still drives the loop.
+  await headless.runEvent("agent_start");
+  await headless.runEvent("turn_end", { turnIndex: 0, message: assistant("thinking"), toolResults: [{ toolName: "bash" }] });
+  await headless.runEvent("agent_end", { messages: [assistant("thinking")] });
+  assert.equal(headless.continuationTriggers(), 1, "agent_end arming still continues a headless goal");
+
+  const interactive = harness({ mode: "tui" });
+  seedActiveGoal(interactive);
+  await interactive.runEvent("session_start", { reason: "resume" });
+  assert.equal(interactive.continuationTriggers(), 1, "interactive resume still arms on a boundary");
+});
+
 await test("headless exit code: model-blocked goal reports 4", async () => {
   await withIsolatedExitCode(async () => {
     const h = harness({ mode: "print" });
