@@ -1,11 +1,19 @@
 {
   "name": "@matthewlam/pi-goal",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Persistent goal mode for pi with automatic idle continuation",
   "type": "module",
-  "keywords": ["pi-package", "pi", "goal", "agent-continuation", "automation"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "goal",
+    "agent-continuation",
+    "automation"
+  ],
   "pi": {
-    "extensions": ["./extension/index.ts"]
+    "extensions": [
+      "./extension/index.ts"
+    ]
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -22,7 +30,11 @@
     "jiti": "^2.7.0",
     "typescript": "^5.9.3"
   },
-  "files": ["extension", "README.md", "LICENSE"],
+  "files": [
+    "extension",
+    "README.md",
+    "LICENSE"
+  ],
   "publishConfig": {
     "access": "public"
   },
